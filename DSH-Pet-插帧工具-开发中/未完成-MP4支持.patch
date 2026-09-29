@@ -1,0 +1,365 @@
+--- "/tmp/v05base/DSH-Pet-\346\217\222\345\270\247\345\267\245\345\205\267\345\214\205/\346\217\222\345\270\247.py"	2026-09-24 22:27:39.808988049 +0800
++++ "~/DSH-Pet-\346\217\222\345\270\247\345\267\245\345\205\267\345\214\205/\346\217\222\345\270\247.py"	2026-09-24 22:26:04.546752857 +0800
+@@ -26,6 +26,7 @@
+ from __future__ import annotations
+ 
+ import argparse
++import base64
+ import json
+ import os
+ import re
+@@ -43,6 +44,8 @@
+     "目标帧率": 72,
+     "插帧模型": "rife-v4.6",
+     "使用第几块显卡": 0,
++    "输出格式": "webm",
++    "MP4背景色": "black",
+     "视频质量CRF": 32,
+     "视频码率kbps": 0,
+     "编码线程数": 0,
+@@ -71,6 +74,14 @@
+ ALPHA_PIX_FMT_PREFIX = ("yuva", "rgba", "bgra", "argb", "abgr",
+                         "ya8", "ya16", "gbrap", "pal8")
+ 
++# 认得的输入后缀。
++# 默认场景是桌宠的 .webm 素材；但既然能输出 mp4 了，普通视频也得能喂进来
++# （不然「输出 mp4」就成了没用的开关）。
++VIDEO_EXTS = (".webm", ".mp4", ".mov", ".mkv", ".avi", ".m4v")
++
++# 输出格式：webm 能带透明通道；mp4 兼容性最好但**装不下透明**。
++OUT_FORMATS = {"webm": ".webm", "mp4": ".mp4"}
++
+ 
+ def decoder_args(codec: str) -> list[str]:
+     return DECODER_ARGS.get((codec or "").lower(), [])
+@@ -287,6 +298,73 @@
+     return False
+ 
+ 
++# --------------------------------------------------------------------- 显卡预检
++# 两张 64x64 的纯色 PNG（纯标准库手搓，一个 136 字节）。
++# 为什么内嵌而不是临时生成：预检发生在「环境检查」阶段，那时还不能假设 ffmpeg
++# 一定可用；内嵌进来就一个外部依赖都不欠。
++_PROBE_PNG = (
++    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAT0lEQVR42u3PQQkAAAgEsItz/VMYywi+hcEKLNO+FgEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQGBywLvDoEAVSaz4wAAAABJRU5ErkJggg==",
++    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAT0lEQVR42u3PQQkAAAgEsItz/VMYywi+hcEKLO28FgEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQGBywLt4oEAvGaPlQAAAABJRU5ErkJggg==",
++)
++
++# rife 启动时会把枚举到的设备打成这种行：[0 NVIDIA GeForce RTX 2060]  queueC=2[8] ...
++_GPU_LINE = re.compile(r"^\[(\d+)\s+([^\]]+?)\]\s")
++
++# 名字里带这些的 = 软件渲染（没显卡时才出现），慢到没法用
++_SOFT_RENDER = ("llvmpipe", "swiftshader", "softpipe", "lavapipe", "soft render")
++# 名字里带这些的 = 核显。能跑，但比独显慢一截
++_INTEGRATED = ("intel", "uhd graphics", "hd graphics", "iris", "radeon graphics",
++               "radeon vega", "microsoft basic")
++
++
++def check_gpus(rife: str, model: str) -> tuple[list[tuple[int, str]], str]:
++    """跑一次最小任务，让 rife 自己把能用的显示设备报出来。
++
++    为什么要让它自己报：命令行上 -g 只是个序号，序号背后是哪块卡只有 rife 知道。
++    光看参数永远发现不了「你以为在用独显，其实一直在跑核显」这种事。
++
++    返回 ([(序号, 名字), ...], 日志最后一行)。拿不到列表时返回 ([], 线索)。
++    """
++    tmp = Path(tempfile.mkdtemp(prefix="dshpet_gpu_"))
++    try:
++        for i, blob in enumerate(_PROBE_PNG):
++            (tmp / f"{i}.png").write_bytes(base64.b64decode(blob))
++        try:
++            p = subprocess.run(
++                [rife, "-0", str(tmp / "0.png"), "-1", str(tmp / "1.png"),
++                 "-o", str(tmp / "out.png"), "-m", model],
++                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
++                stderr=subprocess.STDOUT, timeout=120)
++            text = p.stdout.decode("utf-8", "replace")
++        except subprocess.TimeoutExpired:
++            return [], "预检超时（120 秒没动静）"
++        except FileNotFoundError:
++            return [], "跑不起来（文件不存在？）"
++        devs, seen = [], set()
++        for line in text.splitlines():
++            m = _GPU_LINE.match(line.strip())
++            if m:
++                idx, name = int(m.group(1)), m.group(2).strip()
++                if idx not in seen:
++                    seen.add(idx)
++                    devs.append((idx, name))
++        devs.sort()
++        lines = [ln for ln in (l.strip() for l in text.splitlines()) if ln]
++        return devs, (lines[-1] if lines else "")
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++def is_soft(name: str) -> bool:
++    n = name.lower()
++    return any(k in n for k in _SOFT_RENDER)
++
++
++def is_integrated(name: str) -> bool:
++    n = name.lower()
++    return any(k in n for k in _INTEGRATED)
++
++
+ # --------------------------------------------------------------------- 探素材
+ def probe(ffprobe: str, path: Path) -> dict:
+     """读出编码、宽高、帧率、帧数、时长、是否带 Alpha。
+@@ -336,6 +414,23 @@
+     return info
+ 
+ 
++# MP4 里能原样搬过去、播放器都认的音轨编码。
++# 别的（webm 常用的 opus / vorbis）塞进 mp4 是「文件不报错、但放不出声」——
++# 这种哑巴问题比直接丢音轨还难查，所以直接转成 AAC。
++MP4_OK_AUDIO = ("aac", "mp3", "ac3", "eac3", "alac")
++
++
++def audio_codec(ffprobe: str, path: Path) -> str:
++    """读素材的音轨编码，没有音轨就返回空串。"""
++    text = capture([ffprobe, "-v", "error", "-select_streams", "a:0",
++                    "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(path)])
++    for line in text.splitlines():
++        line = line.strip()
++        if line and line != "N/A":
++            return line.lower()
++    return ""
++
++
+ def already_done(ffprobe: str, dst: Path, target_fps: float, src_dur: float) -> bool:
+     """输出文件已存在、帧率对得上、时长也对得上 → 视为已完成（可续跑）。"""
+     if not dst.is_file() or dst.stat().st_size < 1024:
+@@ -352,7 +447,8 @@
+ def convert_one(ffmpeg: str, ffprobe: str, rife: str, model_dir: Path,
+                 model: str, gpu: int, src: Path, dst: Path,
+                 target_fps: float, crf: int, kbps: int, keep_tmp: bool,
+-                threads: int = 0, keep_audio: bool = True) -> tuple[bool, str]:
++                threads: int = 0, keep_audio: bool = True,
++                out_fmt: str = "webm", mp4_bg: str = "black") -> tuple[bool, str]:
+     t0 = time.time()
+     info = probe(ffprobe, src)
+     if info["frames"] < 2:
+@@ -362,10 +458,14 @@
+     mult = target_fps / src_fps
+     alpha = info["alpha"]
+     dec = decoder_args(info["codec"])
++    mp4 = (out_fmt or "webm").lower() == "mp4"
+ 
+     log(f"    {info['w']}x{info['h']}  {src_fps:.2f}fps → {target_fps:g}fps  "
+         f"（{mult:.2f} 倍：{info['frames']} 帧 → {out_frames} 帧）"
+         f"  [{info['codec'] or '?'} / {'带透明通道' if alpha else '不透明'}]")
++    if mp4 and alpha:
++        log(f"    ⚠️ MP4 装不下透明通道 —— 透明区会压成背景色 {mp4_bg}，"
++            f"要保留透明请把「输出格式」改回 webm")
+ 
+     tmp = Path(tempfile.mkdtemp(prefix="dshpet_"))
+     rgb_in, a_in, rgb_out, a_out = tmp / "rgb", tmp / "a", tmp / "rgb_i", tmp / "a_i"
+@@ -429,14 +529,36 @@
+         n_in = 2 if alpha else 1          # 前面已经用掉的输入个数
+         if keep_audio:
+             cmd += ["-i", str(src)]
+-        if alpha:
++        if alpha and not mp4:
+             cmd += ["-filter_complex", "[0:v][1:v]alphamerge,format=yuva420p[v]",
+                     "-map", "[v]"]
++        elif alpha and mp4:
++            # H.264 根本装不下 alpha，所以先拿背景色当底把透明区压掉，再当普通视频编。
++            # 两个坑：
++            #   · color 生成的是无限长流，不加 shortest=1 会一直编下去
++            #   · color 默认按 25fps 生成，不写死 r= 的话 overlay 会跟着 25fps 走，
++            #     最后输出就变成 25fps —— 帧数是对的，时间轴全错
++            cmd += ["-filter_complex",
++                    "[0:v][1:v]alphamerge,format=yuva420p[fg];"
++                    f"color=c={mp4_bg}:s={info['w']}x{info['h']}:r={target_fps:g}[bg];"
++                    "[bg][fg]overlay=format=auto:shortest=1,format=yuv420p[v]",
++                    "-map", "[v]"]
+         else:
+             cmd += ["-map", "0:v"]
+         if keep_audio:
+-            cmd += ["-map", f"{n_in}:a?", "-c:a", "copy"]
+-        if alpha:
++            cmd += ["-map", f"{n_in}:a?"]
++            if mp4 and acodec and acodec not in MP4_OK_AUDIO:
++                # 例如 webm 的 opus：塞进 mp4 大多数播放器直接哑巴，只能转
++                log(f"    ℹ️ 音轨是 {acodec}，MP4 里放不出声 —— 自动转成 AAC（192k）")
++                cmd += ["-c:a", "aac", "-b:a", "192k"]
++            else:
++                cmd += ["-c:a", "copy"]
++        if mp4:
++            # 兼容性优先：libx264 + yuv420p，什么播放器都认
++            cmd += ["-c:v", "libx264", "-preset", "medium", "-movflags", "+faststart"]
++            if not alpha:
++                cmd += ["-pix_fmt", "yuv420p"]
++        elif alpha:
+             cmd += ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
+                     "-auto-alt-ref", "0", "-row-mt", "1"]
+         else:
+@@ -455,7 +577,10 @@
+ 
+         cost = time.time() - t0
+         size = dst.stat().st_size / 1024 / 1024
+-        kind = "带透明通道" if alpha else "不透明"
++        if mp4:
++            kind = "MP4，不透明"
++        else:
++            kind = "带透明通道" if alpha else "不透明"
+         return True, f"{got} 帧输出（{kind}），{size:.1f} MB，耗时 {cost:.0f} 秒"
+     except Exception as exc:
+         return False, f"出错：{exc}"
+@@ -471,10 +596,12 @@
+     ap.add_argument("--检查", action="store_true", help="只检查环境")
+     ap.add_argument("--试跑", type=int, default=0, metavar="N", help="只处理前 N 个文件")
+     ap.add_argument("--模型", default="", help="覆盖 config.json 里的插帧模型")
+-    # 下面三个主要给图形界面(gui.py)用，命令行用户一般不需要碰
++    # 下面几个主要给图形界面(gui.py)用，命令行用户一般不需要碰
+     ap.add_argument("--帧率", type=float, default=0, metavar="N", help="覆盖 config.json 里的目标帧率")
+     ap.add_argument("--输出", default="", metavar="目录", help="覆盖输出目录")
++    ap.add_argument("--格式", default="", choices=["", "webm", "mp4"], help="覆盖输出格式")
+     ap.add_argument("--允许高风险", action="store_true", help="跳过安全倍数拦截")
++    ap.add_argument("--跳过显卡检查", action="store_true", help="不做显卡预检（省 1~2 秒）")
+     args = ap.parse_args()
+ 
+     hr("DSH Pet 素材定制插帧工具")
+@@ -491,11 +618,18 @@
+         cfg["插帧模型"] = args.模型
+     if args.帧率:
+         cfg["目标帧率"] = args.帧率
++    if args.格式:
++        cfg["输出格式"] = args.格式
+     if args.允许高风险:
+         cfg["允许超过安全倍数"] = True
+     target_fps = float(cfg.get("目标帧率") or 72)
+     model = str(cfg.get("插帧模型") or "rife-v4.6")
+     gpu = int(cfg.get("使用第几块显卡") or 0)
++    out_fmt = str(cfg.get("输出格式") or "webm").strip().lower()
++    if out_fmt not in OUT_FORMATS:
++        log(f"⚠️ 配置里的「输出格式」写的是「{out_fmt}」，只认 webm / mp4，先按 webm 处理。")
++        out_fmt = "webm"
++    mp4_bg = str(cfg.get("MP4背景色") or "black").strip() or "black"
+     crf = int(cfg.get("视频质量CRF") or 32)
+     kbps = int(cfg.get("视频码率kbps") or 0)
+     threads = int(cfg.get("编码线程数") or 0)
+@@ -519,6 +653,49 @@
+         log(f"  ✗ 找不到模型 {model}，这个目录里有：{', '.join(have) or '（没有）'}")
+         return 2
+     log(f"  插帧模型: {model}")
++
++    # ---- 显卡预检：搞清楚到底跑在哪块卡上 ----
++    # 这一步会真跑一次最小任务，多花 1~2 秒。值得：不然「以为在用独显，
++    # 其实一直跑核显/软件渲染」这种坑，只能靠用户自己发现「怎么这么慢」。
++    if not args.跳过显卡检查:
++        devs, tail = check_gpus(rife, model)
++        if not devs:
++            log(f"  ⚠️ 没能问出可用的显示设备（{tail or '没有输出'}）")
++            log("     · 多半是没装带 Vulkan 的显卡驱动。")
++            log("     · Windows：去显卡官网装驱动（NVIDIA / AMD / Intel 驱动都自带 Vulkan）。")
++            log("     · Linux：装 vulkan 驱动（mesa-vulkan-drivers 或 nvidia-driver）。")
++            log("     · 硬跑也能出结果，但会掉到 CPU 软件渲染 —— 一张图好几秒，")
++            log("       十来秒的素材就是几十分钟起步。强烈建议先把驱动搞定。")
++        else:
++            log("  可用显示设备（rife 自己报的，不是你猜的）：")
++            for i, name in devs:
++                if is_soft(name):
++                    kind = "软件渲染·极慢"
++                elif is_integrated(name):
++                    kind = "核显"
++                else:
++                    kind = "独显"
++                mark = "  ← 配置里选的" if i == gpu else ""
++                log(f"     [{i}] {name}  〔{kind}〕{mark}")
++            picked = dict(devs).get(gpu)
++            if picked is None:
++                log(f"  ✗ 配置里选的是第 {gpu} 块卡，但一共只报了 {len(devs)} 块。")
++                log(f"     把 config.json 的「使用第几块显卡」改成 0 ~ {len(devs) - 1} 之间。")
++                return 2
++            if is_soft(picked):
++                log(f"  ⚠️⚠️ 你选的是 [{gpu}] {picked} —— 这是软件渲染，等于拿 CPU 硬算，")
++                log("      会比显卡慢几十倍。先把显卡驱动装上，再挑一块真的卡。")
++            elif is_integrated(picked):
++                better = [i for i, n in devs if not is_soft(n) and not is_integrated(n)]
++                if better:
++                    log(f"  ⚠️ 你选的是 [{gpu}] {picked}（核显）。这台机器还有独显 "
++                        f"[{better[0]}] {dict(devs)[better[0]]}，")
++                    log(f"     把「使用第几块显卡」改成 {better[0]} 会快好几倍。")
++                else:
++                    log(f"  ℹ️ 你选的是 [{gpu}] {picked}（核显）—— 能跑，就是比独显慢一截。")
++            else:
++                log(f"  ✅ 用的是 [{gpu}] {picked}（独显），没问题。")
++
+     if args.检查:
+         hr("检查完毕")
+         log("  ✅ 环境没问题，把素材丢进 input/ 就能开跑了。")
+@@ -530,12 +707,14 @@
+     if src_root.is_file():
+         files = [src_root]
+     elif src_root.is_dir():
+-        files = sorted(p for p in src_root.rglob("*.webm"))
++        files = sorted(p for p in src_root.rglob("*")
++                       if p.is_file() and p.suffix.lower() in VIDEO_EXTS)
+     else:
+         log(f"✗ 找不到输入：{src_root}")
+         return 2
+     if not files:
+-        log(f"✗ {src_root} 里没有 .webm 文件。把素材放进去再跑一次。")
++        log(f"✗ {src_root} 里没有视频文件。")
++        log(f"   认得的后缀：{' '.join(VIDEO_EXTS)} —— 把素材放进去再跑一次。")
+         return 2
+     if limit:
+         files = files[:limit]
+@@ -578,6 +757,8 @@
+ 
+     log("")
+     log(f"  输出目录   : {out_root}")
++    log(f"  输出格式   : {out_fmt}" + ("（MP4 装不下透明，透明素材会压到背景色）"
++                                    if out_fmt == "mp4" else "（能带透明通道）"))
+ 
+     # ---- 逐个处理 ----
+     hr("开始处理")
+@@ -585,8 +766,9 @@
+     t_start = time.time()
+     try:
+         for idx, src in enumerate(files, 1):
+-            rel = src.name if src_root.is_file() else src.relative_to(src_root)
+-            dst = out_root / rel
++            rel = src.name if src_root.is_file() else str(src.relative_to(src_root))
++            # 输出后缀跟着「输出格式」走 —— 不然设了 mp4，出来的还是 .webm，白改
++            dst = out_root / Path(rel).with_suffix(OUT_FORMATS[out_fmt])
+             log(f"\n[{idx}/{len(files)}] {rel}")
+             if already_done(ffprobe, dst, target_fps, probe(ffprobe, src)["dur"]):
+                 log("    已存在且规格一致，跳过（可续跑）")
+@@ -594,7 +776,7 @@
+                 continue
+             good, msg = convert_one(ffmpeg, ffprobe, rife, model_dir, model, gpu,
+                                     src, dst, target_fps, crf, kbps, keep_tmp,
+-                                    threads, keep_audio)
++                                    threads, keep_audio, out_fmt, mp4_bg)
+             if good:
+                 ok += 1
+                 log(f"    ✓ {msg}")
+--- "/tmp/v05base/DSH-Pet-\346\217\222\345\270\247\345\267\245\345\205\267\345\214\205/config.json"	2026-09-24 22:27:39.806870073 +0800
++++ "~/DSH-Pet-\346\217\222\345\270\247\345\267\245\345\205\267\345\214\205/config.json"	2026-09-24 22:25:29.179580740 +0800
+@@ -5,7 +5,11 @@
+     "插帧模型": "rife-v4.6",
+     "_插帧模型说明": "默认 rife-v4.6 —— 只有 rife-v4 系列能自定义插帧倍数，而本工具的核心就是任意帧率。rife-anime 理论对二次元线条更友好，但它只支持固定 2 倍（48fps），填别的帧率脚本会拦下来。",
+     "使用第几块显卡": 0,
+-    "_显卡说明": "多显卡的机器可以填 0 / 1 / 2 换一块。填错了插帧会很慢或者直接报错。",
++    "_显卡说明": "多显卡的机器可以填 0 / 1 / 2 换一块。填错了插帧会很慢或者直接报错。不用自己猜 —— 每次运行开头都会列出「可用的显示设备」并标出你选的是哪块。",
++    "输出格式": "webm",
++    "_输出格式说明": "webm = 能带透明通道（桌宠素材必须是这个）。mp4 = 兼容性最好，什么播放器都认，但**装不下透明**：透明区会被压成下面那个背景色。给普通视频插帧就用 mp4。",
++    "MP4背景色": "black",
++    "_背景色说明": "只在你把「输出格式」设成 mp4、而素材又带透明通道时起作用。填 black 或 white，也可以填 0x1E1E1E 这种十六进制颜色。",
+     "视频质量CRF": 32,
+     "_画质说明": "数字越小画质越好、文件越大。VP9 用 28~34 比较均衡。默认 32。",
+     "视频码率kbps": 0,
+@@ -21,8 +25,8 @@
+     "只处理前N个文件": 0,
+     "_只处理说明": "填 0 = 全部处理。想先试一两个文件练手就填 1 或 2。",
+     "ffmpeg路径": "",
+-    "rife可执行文件路径": "",
+-    "rife模型所在目录": "",
++    "rife可执行文件路径": "~/rife/rife-ncnn-vulkan-20221029-ubuntu/rife-ncnn-vulkan",
++    "rife模型所在目录": "~/rife/rife-ncnn-vulkan-20221029-ubuntu",
+     "_路径说明": "留空即可。自动找不到时，再把绝对路径填进来。Windows 上路径里的反斜杠要写成两个，例如 D:\\\\tools\\\\ffmpeg\\\\bin\\\\ffmpeg.exe。",
+     "处理完删除临时帧": true
+ }

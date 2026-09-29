@@ -1,0 +1,13 @@
+# DSH Pet 素材定制插帧工具 · Python 依赖
+#
+# 本工具**故意做成零第三方依赖** —— 只用到 Python 自带的库。
+# 也就是说这里什么都不用装，留着这个文件只是为了说清楚：
+#   ✔ 不需要 pip install 任何东西
+#   ✔ 不用装 torch / opencv / numpy（RIFE 是现成的可执行文件，不是 Python 包）
+#
+# 你真正需要准备的是两个**外部程序**：
+#   1) ffmpeg / ffprobe   —— 拆帧、合成、编码
+#   2) rife-ncnn-vulkan   —— 插帧本体
+# 具体怎么装看 README.md 的第一节。
+#
+# Python 版本要求：3.8 以上（用到了 pathlib / f-string 之类的基础特性）。

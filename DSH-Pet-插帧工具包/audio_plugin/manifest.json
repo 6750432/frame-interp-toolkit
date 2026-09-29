@@ -1,0 +1,12 @@
+{
+  "schema": "pet-audio-plugin/1",
+  "name": "DSH Pet 音频外挂",
+  "version": "0.1.0",
+  "entry": "worker.py",
+  "说明": "可选组件。提供 AI 音频模型（DPDFNet / FRCRN 等）。整个目录删掉不影响工具本体。",
+  "需要解释器": ">=3.11（只有 AI 模型需要；mock 与 DSP 用系统 python 即可）",
+  "模型": {
+    "mock":     { "文件": "models/mock.py", "依赖": [], "用途": "自检/演示" },
+    "dpdfnet2": { "文件": "models/dpdfnet2.py", "依赖": ["numpy", "onnxruntime", "librosa", "soundfile"], "用途": "语音降噪（16kHz 均衡档）", "状态": "尚未实现" }
+  }
+}
